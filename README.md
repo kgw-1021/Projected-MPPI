@@ -11,13 +11,18 @@ Built on **JAX**, the entire pipeline is JIT-compiled to a single GPU kernel, en
 ### 1. Drone Corridor Navigation (3D)
 The drone navigates a constrained tunnel while strictly adhering to velocity and spatial boundary constraints. The solver corrects the stochastic MPPI samples in real-time.
 
-![Drone Simulation](assets/drone_sim.gif)
+![Drone Simulation1](drone/drone_obstacle.gif)
+*(Place your `drone_sim.gif` file in an `assets` folder)*
+![Drone Simulation2](drone/drone_corridor.gif)
 *(Place your `drone_sim.gif` file in an `assets` folder)*
 
-### 2. Uni-cycle Obstacle Avoidance (2D)
-A non-holonomic vehicle navigates a complex environment. The solver enforces kinematic constraints and collision boundaries.
+### 2. Uni-cycle Narrow Tunnel (2D)
+A non-holonomic vehicle navigates a Narrow Tunnel. Baseline method 
 
-![Uni-cycle Simulation](assets/unicycle_sim.gif)
+![Ours](corridor_test/our_result.gif)
+*(Place your `unicycle_sim.gif` file in an `assets` folder)*
+
+![Baseline (Vanilla B-spline)](corridor_test/baseline_result.gif)
 *(Place your `unicycle_sim.gif` file in an `assets` folder)*
 
 ## Theoretical Foundation & Extensibility
