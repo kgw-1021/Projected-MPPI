@@ -127,7 +127,7 @@ class DenseProjector:
         self.solver = BatchedADMM(n_vars=n_cp * 4, rho=2.0, max_iter=20)
         
         self.u_min = jnp.array([0.0, -1.0, -1.0, -0.2])
-        self.u_max = jnp.array([2.0*MASS*G, 1.0, 1.0, 0.2])
+        self.u_max = jnp.array([3.0*MASS*G, 1.0, 1.0, 0.2])
 
     def _precompute_dense_matrices(self, A, B, H):
         dim_z, dim_u = B.shape
@@ -163,39 +163,59 @@ class DenseProjector:
     def project_single_sample(self, coeffs_noisy, z0, obs_pos, obs_r):
         coeffs_flat = coeffs_noisy.reshape(-1)
         
-        # 1. Rollout
+        # 1. Rollout (Linear Prediction)
+        # traj_flat = Phi * z0 + K * c
         traj_flat = self.get_trajectory_flat(coeffs_flat, z0)
-        traj = traj_flat.reshape(self.H, self.dim_z)
-        pos_traj = traj[:, :3] # (H, 3)
         
-        # 2. Obstacle Constraint Linearization
+        # --- [NEW] Attitude Constraints Preparation ---
+        # Roll(6), Pitch(7) 인덱스 추출 (H horizon 전체에 대해)
+        # 상태 벡터: [pos(3), vel(3), rpy(3), omega(3)] -> rpy는 6,7,8
+        idx_roll = jnp.arange(6, self.H * 12, 12)
+        idx_pitch = jnp.arange(7, self.H * 12, 12)
+        idx_att = jnp.sort(jnp.concatenate([idx_roll, idx_pitch]))
+        
+        # Attitude Limit (약 70도 = 1.22 rad 로 설정하여 안전 마진 확보)
+        MAX_ANGLE = 1.0
+        
+        # Constraint: -MAX < (Phi*z0 + K*c)[idx] < MAX
+        # -> -MAX - (Phi*z0) < K*c < MAX - (Phi*z0)
+        
+        # A_att matrix (Attitude 부분만 슬라이싱)
+        A_att = self.K_mat[idx_att, :] # (2*H, N_cp*4)
+        
+        # Bounds for Attitude
+        pred_free_att = (self.Phi @ z0)[idx_att]
+        l_att = jnp.full_like(pred_free_att, -MAX_ANGLE) - pred_free_att
+        u_att = jnp.full_like(pred_free_att, MAX_ANGLE) - pred_free_att
+        # -----------------------------------------------
+
+        # 2. Obstacle Constraint (기존 코드 유지)
+        traj = traj_flat.reshape(self.H, self.dim_z)
+        pos_traj = traj[:, :3] 
         diff = pos_traj - obs_pos
         dist_sq = jnp.sum(diff**2, axis=1)
         dist = jnp.sqrt(dist_sq + 1e-6)
-        normals = diff / dist[:, None] # (H, 3)
+        normals = diff / dist[:, None]
         
-        # Jacobian J = Slices of K_mat
-        K_pos = self.K_mat.reshape(self.H, self.dim_z, -1)[:, :3, :] # (H, 3, N_vars)
-        
-        # A_obs = -n^T * J
-        A_obs = -jnp.einsum('td,tdv->tv', normals, K_pos) # (H, N_vars)
-        b_obs = -(obs_r + 0.3 - dist) # Margin 0.3
+        K_pos = self.K_mat.reshape(self.H, self.dim_z, -1)[:, :3, :]
+        A_obs = -jnp.einsum('td,tdv->tv', normals, K_pos)
+        b_obs = -(obs_r + 0.3 - dist)
         l_obs = jnp.full_like(b_obs, -1e9)
         
-        # 3. Input Constraints
+        # 3. Input Constraints (기존 코드 유지)
         A_inp = jnp.eye(self.N_cp * 4)
         l_inp = jnp.tile(self.u_min, self.N_cp) - coeffs_flat
         u_inp = jnp.tile(self.u_max, self.N_cp) - coeffs_flat
         
-        # 4. Stack
-        A = jnp.vstack([A_obs, A_inp])
-        l = jnp.concatenate([l_obs, l_inp])
-        u = jnp.concatenate([b_obs, u_inp])
+        # 4. Stack All Constraints (Obstacle + Input + [NEW] Attitude)
+        A = jnp.vstack([A_obs, A_inp, A_att])
+        l = jnp.concatenate([l_obs, l_inp, l_att])
+        u = jnp.concatenate([b_obs, u_inp, u_att])
         
         P = jnp.eye(self.N_cp * 4)
         q = jnp.zeros(self.N_cp * 4)
         
-        # Solve (Projection)
+        # Solve
         delta, _ = self.solver.solve(P, q, A, l, u)
         
         return (coeffs_flat + delta).reshape(self.N_cp, 4)
@@ -237,24 +257,33 @@ class ProjectedMPPI:
     def compute_cost(self, coeffs, z0, target, obs_pos, obs_r):
         u_seq = self.bspline.get_sequence(coeffs)
         
-        # Nonlinear Scan for accurate cost
         def scan_fn(z, u):
             z_next = se3_step(z, u, self.dt)
             return z_next, z_next
         _, traj = jax.lax.scan(scan_fn, z0, u_seq)
         
         pos = traj[:, :3]
-        vel = traj[:, 3:6]  
+        vel = traj[:, 3:6]
+        rpy = traj[:, 6:9]  # [NEW] 자세 각도 추출
+        
         dist_err = jnp.sum((pos - target)**2)
         vel_running = jnp.sum(vel**2) * 0.05
-        vel_terminal = jnp.sum(vel[-1]**2) * 30.0
+        vel_terminal = jnp.sum(vel[-1]**2) * 5.0
         final_err = jnp.sum((pos[-1] - target)**2) * 50.0
 
-        # Obstacle Cost (Soft penalty for MPPI selection)
+        # Obstacle Cost
         obs_dist = jnp.linalg.norm(pos - obs_pos, axis=1)
         obs_pen = jnp.sum(jnp.exp(-2.0*(obs_dist - obs_r))) * 50.0
         
-        return dist_err + final_err + obs_pen + vel_running + vel_running + vel_terminal 
+        # --- [NEW] Attitude Cost ---
+        # 1. Soft penalty: 평소에 수평을 유지하려는 성향
+        att_energy = jnp.sum(rpy[:, :2]**2) * 1.0 
+        
+        # 2. Barrier penalty: 1.0 rad (약 57도)를 넘으면 급격히 비용 증가
+        #    QP가 막아주겠지만 MPPI 샘플링 단에서도 피하도록 유도
+        att_violation = jnp.sum(jnp.maximum(0, jnp.abs(rpy[:, :2]) - 1.0)**2) * 50.0
+        
+        return dist_err + final_err + obs_pen + vel_running + vel_terminal + att_energy + att_violation
 
 def plot_profiles(history_dict, dt):
     """
@@ -280,7 +309,7 @@ def plot_profiles(history_dict, dt):
     # 2. Control Input: Thrust
     axes[1].plot(time_steps, u[:, 0], label='Thrust', color='k')
     # Saturation Line (Max Thrust)
-    axes[1].axhline(y=20.0, color='r', linestyle='--', alpha=0.5, label='Max Thrust')
+    axes[1].axhline(y=3.0*MASS*G, color='r', linestyle='--', alpha=0.5, label='Max Thrust')
     axes[1].set_ylabel('Thrust [N]')
     axes[1].set_title('Control Input: Thrust')
     axes[1].legend(loc='upper right')
@@ -308,9 +337,9 @@ def plot_profiles(history_dict, dt):
 def run_simulation(save_gif=True, gif_filename="drone_obstacle.gif"):
     # Params
     DT = 0.01      
-    H = 40         
+    H = 30         
     N_CP = 10
-    K = 128
+    K = 512
     
     mppi = ProjectedMPPI  (H, N_CP, DT, K, 0.8)
     
@@ -406,4 +435,4 @@ def run_simulation(save_gif=True, gif_filename="drone_obstacle.gif"):
     plot_profiles(profile_data, DT)
 
 if __name__ == "__main__":
-    run_simulation(save_gif=False, gif_filename="drone_obstacle.gif")
+    run_simulation(save_gif=True, gif_filename="drone_obstacle.gif")

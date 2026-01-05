@@ -6,8 +6,6 @@ from functools import partial
 from mpl_toolkits.mplot3d import Axes3D
 from optimize import BatchedADMM
 import time
-import os
-import shutil   
 import io
 import imageio.v2 as imageio
 
@@ -107,8 +105,8 @@ class KoopmanWallProjector:
         
         self.solver = BatchedADMM(n_vars=n_cp * 4, rho=5.0, max_iter=30)
         
-        self.u_min = jnp.array([0.0, -1.0, -1.0, -0.2])
-        self.u_max = jnp.array([2.0*MASS*G, 1.0, 1.0, 0.2])
+        self.u_min = jnp.array([0.0, -0.8, -0.8, -0.2])
+        self.u_max = jnp.array([2.0*MASS*G, 0.8, 0.8, 0.2])
 
     def _precompute_dense_matrices(self, A, B, H):
         dim_z, dim_u = B.shape
@@ -133,26 +131,18 @@ class KoopmanWallProjector:
         return self.Phi @ z0 + self.K_mat @ coeffs_flat
 
     def get_window_bounds(self, x_traj, window_center, window_size, wall_range, margin):
-        """
-        Margin을 고려하여 드론의 중심(Point Mass)이 갈 수 있는 유효 공간을 계산합니다.
-        Effective Size = Actual Window Size - 2 * Margin
-        """
         wall_start, wall_end = wall_range
         
-        # 터널 구간
         in_tunnel = (x_traj >= wall_start) & (x_traj <= wall_end)
         
         y_center, z_center = window_center
         w_y, w_z = window_size
         
-        # [핵심 변경] 터널 안에서의 허용 범위 = (창문 크기 / 2) - 마진
-        # 마진만큼 벽에서 떨어져야 함
-        safe_half_y = jnp.maximum(w_y/2.0 - margin, 0.01) # 최소폭 보장
+        safe_half_y = jnp.maximum(w_y/2.0 - margin, 0.01)
         safe_half_z = jnp.maximum(w_z/2.0 - margin, 0.01)
         
         y_bound = jnp.where(in_tunnel, safe_half_y, 4.0) 
         
-        # 천장과 바닥도 마진 적용
         z_bound_u = jnp.where(in_tunnel, z_center + safe_half_z, 6.0)
         z_bound_l = jnp.where(in_tunnel, z_center - safe_half_z, 0.0)
         
@@ -165,7 +155,7 @@ class KoopmanWallProjector:
         traj = traj_flat.reshape(self.H, self.dim_z)
         pos_x = traj[:, 0]
         
-        # Margin을 포함하여 Bound 계산
+        # 1. Wall/Window Constraints
         y_half_bound, z_min, z_max = self.get_window_bounds(pos_x, window_center, window_size, wall_range, margin)
         
         K_tensor = self.K_mat.reshape(self.H, self.dim_z, -1)
@@ -176,29 +166,40 @@ class KoopmanWallProjector:
         const_y = const_traj[:, 1]
         const_z = const_traj[:, 2]
 
-        # Constraints Setup
-        A_y_upper = K_y
-        b_y_upper = y_half_bound - const_y
-        A_y_lower = -K_y
-        b_y_lower = y_half_bound + const_y 
-
-        A_z_upper = K_z
-        b_z_upper = z_max - const_z
-        A_z_lower = -K_z
-        b_z_lower = -z_min + const_z
+        A_y_upper = K_y; b_y_upper = y_half_bound - const_y
+        A_y_lower = -K_y; b_y_lower = y_half_bound + const_y 
+        A_z_upper = K_z; b_z_upper = z_max - const_z
+        A_z_lower = -K_z; b_z_lower = -z_min + const_z
         
-        # Input Constraints
+        # 2. [NEW] Attitude Constraints
+        # Roll(6) & Pitch(7)
+        idx_roll = jnp.arange(6, self.H * 12, 12)
+        idx_pitch = jnp.arange(7, self.H * 12, 12)
+        idx_att = jnp.sort(jnp.concatenate([idx_roll, idx_pitch]))
+        
+        # Limit set to 1.2 rad (~68 deg) for safety with linear model
+        MAX_ANGLE = 1.0
+        
+        A_att = self.K_mat[idx_att, :]
+        pred_free_att = (self.Phi @ z0)[idx_att]
+        
+        l_att = jnp.full_like(pred_free_att, -MAX_ANGLE) - pred_free_att
+        u_att = jnp.full_like(pred_free_att, MAX_ANGLE) - pred_free_att
+        
+        # 3. Input Constraints
         A_inp = jnp.eye(self.N_cp * 4)
         l_inp = jnp.tile(self.u_min, self.N_cp) - coeffs_flat
         u_inp = jnp.tile(self.u_max, self.N_cp) - coeffs_flat
 
+        # 4. Stack All Constraints (Wall + Attitude + Input)
         A_ineq = jnp.vstack([A_y_upper, A_y_lower, A_z_upper, A_z_lower])
         u_ineq = jnp.concatenate([b_y_upper, b_y_lower, b_z_upper, b_z_lower])
         l_ineq = jnp.full_like(u_ineq, -1e9)
         
-        A = jnp.vstack([A_ineq, A_inp])
-        l = jnp.concatenate([l_ineq, l_inp])
-        u = jnp.concatenate([u_ineq, u_inp])
+        # Stack Order: [Wall_Ineq, Attitude_Box, Input_Box]
+        A = jnp.vstack([A_ineq, A_att, A_inp])
+        l = jnp.concatenate([l_ineq, l_att, l_inp])
+        u = jnp.concatenate([u_ineq, u_att, u_inp])
         
         P = jnp.eye(self.N_cp * 4)
         q = jnp.zeros(self.N_cp * 4)
@@ -225,7 +226,6 @@ class KoopmanMPPI:
         noise = jax.random.normal(key, (self.K, self.N_cp, 4)) * std
         samples = mean_coeffs + noise
         
-        # Projector에도 Margin 전달
         safe_samples = jax.vmap(self.projector.project_single_sample, in_axes=(0, None, None, None, None, None))(
             samples, z_curr, win_center, win_size, wall_range, margin
         )
@@ -250,21 +250,18 @@ class KoopmanMPPI:
         
         pos = traj[:, :3]
         vel = traj[:, 3:6]
+        rpy = traj[:, 6:9] # [NEW]
         
         dist_err = jnp.sum((pos - target)**2)
-        final_err = jnp.sum((pos[-1] - target)**2) * 20.0
+        final_err = jnp.sum((pos[-1] - target)**2) * 30.0
         
-        # --- Tunnel Violation Cost (With Margin) ---
+        # Tunnel Cost
         x, y, z = pos[:, 0], pos[:, 1], pos[:, 2]
         yc, zc = win_center
         wy, wz = win_size
         wall_start, wall_end = wall_range
         
         in_tunnel = (x >= wall_start) & (x <= wall_end)
-        
-        # 물리적 벽까지의 거리가 margin보다 작아지면 비용 발생
-        # Violation = |pos - center| - (Half_Width - Margin)
-        # 즉, 안전 영역(중심에서 Half_Width - Margin)을 벗어나면 페널티
         
         safe_hy = wy/2.0 - margin
         safe_hz = wz/2.0 - margin
@@ -275,11 +272,19 @@ class KoopmanMPPI:
         tunnel_cost = jnp.sum(in_tunnel * (jnp.exp(30.0 * y_viol) + jnp.exp(30.0 * z_viol) - 2.0))
         
         vel_cost = jnp.sum(vel**2) * 0.01
+
+        # --- [NEW] Attitude Cost ---
+        # 1. Soft Cost (Energy Minimization)
+        att_energy = jnp.sum(rpy[:, :2]**2) * 1.0
         
-        return dist_err + final_err + 20.0 * tunnel_cost + vel_cost
+        # 2. Hard Barrier (Avoid > 1.0 rad)
+        # QP가 1.2 rad에서 막아주지만, MPPI 샘플링 단에서도 회피 유도
+        att_barrier = jnp.sum(jnp.maximum(0, jnp.abs(rpy[:, :2]) - 1.0)**2) * 50.0
+        
+        return dist_err + final_err + 20.0 * tunnel_cost + vel_cost + att_energy + att_barrier
 
 # =========================================================
-# 5. Main Simulation & Visualization (Sphere Draw)
+# 5. Main Simulation & Visualization
 # =========================================================
 
 def draw_tunnel(ax, wall_range, win_center, win_size):
@@ -289,8 +294,6 @@ def draw_tunnel(ax, wall_range, win_center, win_size):
     hy, hz = wy/2, wz/2
     
     x = np.linspace(x_start, x_end, 10)
-    
-    # Visual은 "물리적 벽"을 그립니다 (Margin 적용 전 실제 벽 위치)
     
     # 1. Floor & Ceiling
     y = np.linspace(yc - hy, yc + hy, 2)
@@ -315,7 +318,6 @@ def draw_tunnel(ax, wall_range, win_center, win_size):
         ax.plot([x_pos]*5, ys, zs, 'k-', linewidth=1.5)
 
 def draw_drone_sphere(ax, pos, radius):
-    """드론의 크기(Margin)를 구 형태로 시각화"""
     u = np.linspace(0, 2 * np.pi, 10)
     v = np.linspace(0, np.pi, 10)
     x = radius * np.outer(np.cos(u), np.sin(v)) + pos[0]
@@ -324,18 +326,13 @@ def draw_drone_sphere(ax, pos, radius):
     ax.plot_wireframe(x, y, z, color='b', alpha=0.3)
 
 def plot_profiles(history_dict, dt):
-    """
-    RPY, Thrust, Torques 프로파일링 시각화 함수
-    """
     rpy = np.array(history_dict['rpy'])
     u = np.array(history_dict['u'])
     
-    # 시간 축 생성
     time_steps = np.arange(len(rpy)) * dt
     
     fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
     
-    # 1. Attitude (RPY)
     axes[0].plot(time_steps, rpy[:, 0], label='Roll (phi)', color='r')
     axes[0].plot(time_steps, rpy[:, 1], label='Pitch (theta)', color='g')
     axes[0].plot(time_steps, rpy[:, 2], label='Yaw (psi)', color='b')
@@ -344,22 +341,16 @@ def plot_profiles(history_dict, dt):
     axes[0].legend(loc='upper right')
     axes[0].grid(True)
     
-    # 2. Control Input: Thrust
     axes[1].plot(time_steps, u[:, 0], label='Thrust', color='k')
-    # Saturation Line (Max Thrust)
-    axes[1].axhline(y=20.0, color='r', linestyle='--', alpha=0.5, label='Max Thrust')
+    axes[1].axhline(y=2.0*MASS*G, color='r', linestyle='--', alpha=0.5, label='Max Thrust')
     axes[1].set_ylabel('Thrust [N]')
     axes[1].set_title('Control Input: Thrust')
     axes[1].legend(loc='upper right')
     axes[1].grid(True)
     
-    # 3. Control Input: Torques
     axes[2].plot(time_steps, u[:, 1], label='Torque X', color='r', linestyle='--')
     axes[2].plot(time_steps, u[:, 2], label='Torque Y', color='g', linestyle='--')
     axes[2].plot(time_steps, u[:, 3], label='Torque Z', color='b', linestyle='--')
-    # Saturation Line (Max Torque)
-    axes[2].axhline(y=1.0, color='gray', linestyle=':', alpha=0.5)
-    axes[2].axhline(y=-1.0, color='gray', linestyle=':', alpha=0.5)
     axes[2].set_ylabel('Torque [Nm]')
     axes[2].set_xlabel('Time [s]')
     axes[2].set_title('Control Input: Torques')
@@ -373,16 +364,15 @@ def run_simulation(save_gif=True, gif_filename="drone_corridor.gif"):
     DT = 0.01
     H = 40
     N_CP = 10
-    K = 128
+    K = 512
     
     mppi = KoopmanMPPI(H, N_CP, DT, K, 1.0)
     
     z_curr = jnp.zeros(12)
-    z_curr = z_curr.at[2].set(1.0) 
+    z_curr = z_curr.at[2].set(0.0) 
     
-    # --- 시나리오 설정 ---
-    wall_range = jnp.array([2.0, 6.0]) # 긴 터널
-    target = jnp.array([8.0, 0.0, 2.0])
+    wall_range = jnp.array([3.0, 9.0]) 
+    target = jnp.array([11.0, 0.0, 4.0])
     win_center = jnp.array([0.0, 2.0])
     win_size = jnp.array([0.8, 0.8])
     
@@ -400,18 +390,16 @@ def run_simulation(save_gif=True, gif_filename="drone_corridor.gif"):
     frames = []
     profile_data = {'rpy': [], 'u': []}
 
-    print(f"Simulation Running...")
+    print("Simulation Running...")
     
-    for t in range(400):
+    for t in range(500):
         key, subkey = jax.random.split(key)
         
         t0 = time.time()
-        # Margin 전달
         mean_coeffs, samples, weights = mppi.step(
             subkey, mean_coeffs, z_curr, target, win_center, win_size, wall_range, MARGIN
         )
         jax.block_until_ready(mean_coeffs)
-        calc_time = time.time() - t0
         
         u_applied = mppi.bspline.get_sequence(mean_coeffs)[0]
         z_curr = se3_step(z_curr, u_applied, DT)
@@ -422,12 +410,9 @@ def run_simulation(save_gif=True, gif_filename="drone_corridor.gif"):
 
         dist = jnp.linalg.norm(z_curr[:3] - target)
         
-        if t % 1 == 0:
+        if t % 5 == 0: # Render speed up
             ax.cla()
-            
             draw_tunnel(ax, wall_range, win_center, win_size)
-            
-            # [추가] 드론을 구(Sphere)로 그리기
             draw_drone_sphere(ax, z_curr[:3], MARGIN - 0.15)
             
             top_idx = np.argsort(np.array(weights))[-20:]
@@ -441,13 +426,11 @@ def run_simulation(save_gif=True, gif_filename="drone_corridor.gif"):
             ax.plot(hist[:,0], hist[:,1], hist[:,2], 'b-', linewidth=2)
             ax.scatter(target[0], target[1], target[2], c='r', marker='*', s=200)
             
-            ax.set_xlim(-1, 9)
-            ax.set_ylim(-3, 3)
-            ax.set_zlim(0, 5)
+            ax.set_xlim(-1, 14); ax.set_ylim(-3, 3); ax.set_zlim(0, 5)
             
             if save_gif:
                 buf = io.BytesIO()
-                plt.savefig(buf, format='png', dpi=180)
+                plt.savefig(buf, format='png', dpi=100)
                 buf.seek(0)
                 frames.append(imageio.imread(buf))
                 buf.close()
@@ -460,11 +443,11 @@ def run_simulation(save_gif=True, gif_filename="drone_corridor.gif"):
             
     if save_gif and len(frames) > 0:
         imageio.mimsave(gif_filename, frames, fps=8, loop=0)
-        print("Done!")
+        print(f"Saved {gif_filename}")
     else: 
         plt.show()
 
     plot_profiles(profile_data, DT)
 
 if __name__ == "__main__":
-    run_simulation(save_gif=True, gif_filename="drone_corridor.gif")
+    run_simulation(save_gif=True)

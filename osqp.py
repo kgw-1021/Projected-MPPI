@@ -166,7 +166,6 @@ class QPProjector:
         
         init_params = solver_init_state if solver_init_state is not None else None
         
-        # params_ineq 만 사용 (등식 제약을 부등식 2개로 변환했으므로)
         sol = self.qp.run(
             init_params=init_params, 
             params_obj=(P, q), 

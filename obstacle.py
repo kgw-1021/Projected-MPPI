@@ -84,7 +84,7 @@ class KoopmanQPProjector:
         return jax.jacfwd(self.rollout_fn, argnums=0)(coeffs, z0)
 
     @partial(jax.jit, static_argnums=(0,))
-    def project_single_sample(self, coeffs_noisy, z0, obs_pos, obs_r, target_pos):
+    def project_single_sample(self, coeffs_noisy, z0, obs_pos, obs_r, prev_solver_state):
         # 1. 궤적 및 자코비안 계산
         p_traj = self.rollout_fn(coeffs_noisy, z0)      # (H, 6) [x,y,c,s,v,w]
         J_tensor = self.jac_fn(coeffs_noisy, z0)        # (H, 6, N_CP, 2)
@@ -150,6 +150,8 @@ class KoopmanQPProjector:
         P = jnp.eye(self.dim_var)
         q = jnp.zeros(self.dim_var)
         
+        # init_params = prev_solver_state if prev_solver_state is not None else None
+
         # ADMM Solve
         delta, final_state = self.solver.solve(P, q, A, l, u)
 
@@ -216,7 +218,7 @@ class KoopmanMPPI:
         
         # 2. Parallel Projection (Safety Filter)
         project_fn = jax.vmap(self.projector.project_single_sample, in_axes=(0, None, None, None, None))
-        safe_samples, solver_states = project_fn(raw_samples, z0, obs_pos, obs_r, target_pos)
+        safe_samples, solver_states = project_fn(raw_samples, z0, obs_pos, obs_r, prev_solver_state)
         
         # 3. Cost Evaluation & Masking
         cost_fn = jax.vmap(self.compute_cost, in_axes=(0, None, None, None, None))
@@ -246,7 +248,7 @@ def run():
     DT = 0.1
     HORIZON = 30
     N_CP = 10
-    N_SAMPLES = 100  
+    N_SAMPLES = 500  
     TEMP = 0.5      
     
     bspline_gen = BSplineBasis(N_CP, HORIZON)

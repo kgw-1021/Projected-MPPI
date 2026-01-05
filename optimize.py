@@ -13,7 +13,7 @@ class BatchedADMM:
         self.max_iter = max_iter
 
     @partial(jax.jit, static_argnums=(0,))
-    def solve(self, P, q, A, l, u, init_x=None, init_z=None, init_y=None):
+    def solve(self, P, q, A, l, u, init_params=None):
         """
         P: (n, n) - Positive definite matrix (Cost Hessian)
         q: (n,)   - Linear cost
@@ -32,9 +32,9 @@ class BatchedADMM:
         L = jax.scipy.linalg.cholesky(K, lower=True)
 
         # 2. Initialization
-        x = jnp.zeros(self.n) if init_x is None else init_x
-        z = jnp.zeros(m)      if init_z is None else init_z
-        y = jnp.zeros(m)      if init_y is None else init_y # Dual variable
+        x = jnp.zeros(self.n) if init_params is None else init_params[0]
+        z = jnp.zeros(m)      if init_params is None else init_params[1]
+        y = jnp.zeros(m)      if init_params is None else init_params[2] # Dual variable
 
         # 3. ADMM Loop (Fixed Iterations -> No Branching)
         def body_fn(i, val):
