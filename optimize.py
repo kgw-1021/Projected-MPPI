@@ -41,9 +41,7 @@ class BatchedADMM:
             
             # --- x-update ---
             # Solve: (P + rho*A'A)x = rho*A'(z - u/rho) - q
-            # rhs = rho * A.T @ (z - y) - q  (Standard ADMM form scaled y)
-            # 여기서는 OSQP paper form: sigma=0, rho 사용
-            
+            # rhs = rho * A.T @ (z - y) - q 
             rhs = self.rho * A.T @ (z - y / self.rho) - q
             
             # Forward/Backward Substitution using Cholesky factor L
@@ -62,7 +60,6 @@ class BatchedADMM:
             
             return (x_new, z_new, y_new)
 
-        # jax.lax.fori_loop is faster than python loop inside JIT
         x_final, z_final, y_final = jax.lax.fori_loop(0, self.max_iter, body_fn, (x, z, y))
         
         return x_final, (x_final, z_final, y_final)
