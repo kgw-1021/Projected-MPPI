@@ -51,7 +51,7 @@ class QPProjector:
         self.bspline = bspline_gen
         
         # [최적화 유지] Solver 제한 완화 (전체 궤적을 넣으면 문제 크기가 커지므로 tol을 살짝 낮춤)
-        self.qp = jaxopt.OSQP(tol=1e-2, maxiter=50)
+        self.qp = jaxopt.OSQP(tol=1e-2, maxiter=20)
 
         self.u_min = jnp.array([-1.0, -2.0])  # 감속, 우회전 가속 최대치
         self.u_max = jnp.array([ 1.0,  2.0])  # 가속, 좌회전 가속 최대치
@@ -269,7 +269,7 @@ def run():
     DT = 0.1
     HORIZON = 30
     N_CP = 10
-    N_SAMPLES = 100 
+    N_SAMPLES = 500 
     TEMP = 0.5
     
     bspline_gen = BSplineBasis(N_CP, HORIZON)

@@ -60,7 +60,7 @@ class QPProjector:
 
         # [Solver] BatchedADMM (Custom Implementation)
         # rho: Penalty Parameter (2.0 ~ 5.0 권장)
-        self.solver = BatchedADMM(n_vars=self.dim_var, rho=2.0, max_iter=50)
+        self.solver = BatchedADMM(n_vars=self.dim_var, rho=2.0, max_iter=20)
 
         # [Constraints] 입력은 이제 '가속도'입니다.
         # 선가속도: -1.0 ~ 1.0 m/s^2, 각가속도: -2.0 ~ 2.0 rad/s^2

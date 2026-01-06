@@ -124,7 +124,7 @@ class DenseProjector:
         
         # Solver & Constraints
         # user provided ADMM is used here
-        self.solver = BatchedADMM(n_vars=n_cp * 4, rho=2.0, max_iter=5)
+        self.solver = BatchedADMM(n_vars=n_cp * 4, rho=2.0, max_iter=20)
         
         self.u_min = jnp.array([0.0, -1.0, -1.0, -0.2])
         self.u_max = jnp.array([3.0*MASS*G, 1.0, 1.0, 0.2])
