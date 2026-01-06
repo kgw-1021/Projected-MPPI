@@ -28,7 +28,6 @@ class BatchedADMM:
         K = P + self.rho * (A.T @ A) + jnp.eye(self.n) * 1e-6
         
         # Cholesky Decomposition: K = L @ L.T
-        # 역행렬을 직접 구하는 것보다 solve(L, ...)을 쓰는게 더 빠르고 안정적임
         L = jax.scipy.linalg.cholesky(K, lower=True)
 
         # 2. Initialization

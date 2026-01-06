@@ -88,7 +88,7 @@ def get_linear_model(dt):
 # =========================================================
 # 3. Dense QP Projector 
 # =========================================================
-class KoopmanWallProjector:
+class QPProjector:
     def __init__(self, horizon, n_cp, dt, bspline_gen):
         self.H = horizon
         self.N_cp = n_cp
@@ -103,10 +103,10 @@ class KoopmanWallProjector:
         self.M_spline = jnp.kron(base_mat, jnp.eye(self.dim_u))
         self.K_mat = self.Gamma @ self.M_spline 
         
-        self.solver = BatchedADMM(n_vars=n_cp * 4, rho=5.0, max_iter=30)
+        self.solver = BatchedADMM(n_vars=n_cp * 4, rho=2.0, max_iter=10)
         
-        self.u_min = jnp.array([0.0, -0.8, -0.8, -0.2])
-        self.u_max = jnp.array([2.0*MASS*G, 0.8, 0.8, 0.2])
+        self.u_min = jnp.array([0.0, -1.0, -1.0, -0.2])
+        self.u_max = jnp.array([2.0*MASS*G, 1.0, 1.0, 0.2])
 
     def _precompute_dense_matrices(self, A, B, H):
         dim_z, dim_u = B.shape
@@ -208,16 +208,16 @@ class KoopmanWallProjector:
         return (coeffs_flat + delta).reshape(self.N_cp, 4)
 
 # =========================================================
-# 4. Koopman MPPI (With Margin Cost)
+# 4. Projected MPPI 
 # =========================================================
-class KoopmanMPPI:
+class ProjectedMPPI:
     def __init__(self, horizon, n_cp, dt, n_samples, temp):
         self.H = horizon
         self.N_cp = n_cp
         self.K = n_samples
         self.temp = temp
         self.bspline = BSplineBasis(n_cp, horizon)
-        self.projector = KoopmanWallProjector(horizon, n_cp, dt, self.bspline)
+        self.projector = QPProjector(horizon, n_cp, dt, self.bspline)
         self.dt = dt
 
     @partial(jax.jit, static_argnums=(0,))
@@ -362,11 +362,11 @@ def plot_profiles(history_dict, dt):
 
 def run_simulation(save_gif=True, gif_filename="drone_corridor.gif"):
     DT = 0.01
-    H = 40
+    H = 50
     N_CP = 10
     K = 512
     
-    mppi = KoopmanMPPI(H, N_CP, DT, K, 1.0)
+    mppi = ProjectedMPPI(H, N_CP, DT, K, 1.0)
     
     z_curr = jnp.zeros(12)
     z_curr = z_curr.at[2].set(0.0) 
@@ -400,7 +400,9 @@ def run_simulation(save_gif=True, gif_filename="drone_corridor.gif"):
             subkey, mean_coeffs, z_curr, target, win_center, win_size, wall_range, MARGIN
         )
         jax.block_until_ready(mean_coeffs)
-        
+        t_end = time.time()
+        solver_ms = (t_end - t0) * 1000.0
+
         u_applied = mppi.bspline.get_sequence(mean_coeffs)[0]
         z_curr = se3_step(z_curr, u_applied, DT)
         traj_hist.append(z_curr[:3])
@@ -410,7 +412,7 @@ def run_simulation(save_gif=True, gif_filename="drone_corridor.gif"):
 
         dist = jnp.linalg.norm(z_curr[:3] - target)
         
-        if t % 5 == 0: # Render speed up
+        if t % 1 == 0: # Render speed up
             ax.cla()
             draw_tunnel(ax, wall_range, win_center, win_size)
             draw_drone_sphere(ax, z_curr[:3], MARGIN - 0.15)
@@ -436,6 +438,7 @@ def run_simulation(save_gif=True, gif_filename="drone_corridor.gif"):
                 buf.close()
             else:
                 plt.pause(0.01)
+                print(f"Step {t}, Dist to Target: {dist:.3f}, Solver Time: {solver_ms:.2f} ms")
             
         if dist < 0.2:
             print("Target Reached!")
@@ -450,4 +453,4 @@ def run_simulation(save_gif=True, gif_filename="drone_corridor.gif"):
     plot_profiles(profile_data, DT)
 
 if __name__ == "__main__":
-    run_simulation(save_gif=True)
+    run_simulation(save_gif=False)

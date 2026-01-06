@@ -124,7 +124,7 @@ class DenseProjector:
         
         # Solver & Constraints
         # user provided ADMM is used here
-        self.solver = BatchedADMM(n_vars=n_cp * 4, rho=2.0, max_iter=20)
+        self.solver = BatchedADMM(n_vars=n_cp * 4, rho=2.0, max_iter=5)
         
         self.u_min = jnp.array([0.0, -1.0, -1.0, -0.2])
         self.u_max = jnp.array([3.0*MASS*G, 1.0, 1.0, 0.2])
@@ -269,11 +269,11 @@ class ProjectedMPPI:
         dist_err = jnp.sum((pos - target)**2)
         vel_running = jnp.sum(vel**2) * 0.05
         vel_terminal = jnp.sum(vel[-1]**2) * 5.0
-        final_err = jnp.sum((pos[-1] - target)**2) * 50.0
+        final_err = jnp.sum((pos[-1] - target)**2) * 100.0
 
         # Obstacle Cost
         obs_dist = jnp.linalg.norm(pos - obs_pos, axis=1)
-        obs_pen = jnp.sum(jnp.exp(-2.0*(obs_dist - obs_r))) * 50.0
+        obs_pen = jnp.sum(jnp.exp(-2.0*(obs_dist - obs_r))) * 30.0
         
         # --- [NEW] Attitude Cost ---
         # 1. Soft penalty: 평소에 수평을 유지하려는 성향
@@ -337,11 +337,11 @@ def plot_profiles(history_dict, dt):
 def run_simulation(save_gif=True, gif_filename="drone_obstacle.gif"):
     # Params
     DT = 0.01      
-    H = 30         
+    H = 40         
     N_CP = 10
-    K = 512
+    K = 256
     
-    mppi = ProjectedMPPI  (H, N_CP, DT, K, 0.8)
+    mppi = ProjectedMPPI(H, N_CP, DT, K, 0.8)
     
     # Init State: x,y,z=0, vx,vy,vz=0, rpy=0, omega=0
     z_curr = jnp.zeros(12)
@@ -435,4 +435,4 @@ def run_simulation(save_gif=True, gif_filename="drone_obstacle.gif"):
     plot_profiles(profile_data, DT)
 
 if __name__ == "__main__":
-    run_simulation(save_gif=True, gif_filename="drone_obstacle.gif")
+    run_simulation(save_gif=False, gif_filename="drone_obstacle.gif")

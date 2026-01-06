@@ -50,7 +50,7 @@ def step_(state, control, dt):
 # 2. QP Projector (Safety Filter + Terminal Constraints)
 # =========================================================
 
-class KoopmanQPProjector:
+class QPProjector:
     def __init__(self, horizon, n_cp, dt, bspline_gen):
         self.H = horizon
         self.N_cp = n_cp
@@ -160,17 +160,17 @@ class KoopmanQPProjector:
         return safe_coeffs, final_state
 
 # =========================================================
-# 3. Koopman MPPI (Updated Logic)
+# 3. Projected MPPI 
 # =========================================================
 
-class KoopmanMPPI:
+class ProjectedMPPI:
     def __init__(self, horizon, n_cp, dt, n_samples, temperature, bspline_gen):
         self.H = horizon
         self.N_cp = n_cp
         self.dt = dt
         self.K = n_samples
         self.lambda_ = temperature
-        self.projector = KoopmanQPProjector(horizon, n_cp, dt, bspline_gen)
+        self.projector = QPProjector(horizon, n_cp, dt, bspline_gen)
 
     @partial(jax.jit, static_argnums=(0,))
     def compute_cost(self, coeffs, z0, target_pos, obs_pos, obs_r):
@@ -252,7 +252,7 @@ def run():
     TEMP = 0.5      
     
     bspline_gen = BSplineBasis(N_CP, HORIZON)
-    mppi = KoopmanMPPI(HORIZON, N_CP, DT, N_SAMPLES, TEMP, bspline_gen)
+    mppi = ProjectedMPPI(HORIZON, N_CP, DT, N_SAMPLES, TEMP, bspline_gen)
     
     # [초기 상태] x, y, theta, v, w (5차원)
     start_pose = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0])
