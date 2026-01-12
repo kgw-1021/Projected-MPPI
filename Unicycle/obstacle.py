@@ -1,16 +1,11 @@
-﻿import jax
+import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from functools import partial
 import numpy as np
-from Bspline import BSplineBasis
+from Util.Bspline import BSplineBasis
+from Util.optimize import BatchedADMM 
 import time
-
-# [NEW] JaxProxQP Imports
-from jaxproxqp.jaxproxqp import JaxProxQP
-from jaxproxqp.qp_problems import QPModel
-from jaxproxqp.settings import Settings
-
 # =========================================================
 # 1. System Dynamics (Dynamics with Acceleration)
 # =========================================================
@@ -18,8 +13,8 @@ from jaxproxqp.settings import Settings
 @jax.jit
 def lift_state(state_std):
     """
-    state_std: [x, y, theta, v, w]
-    Returns:   [x, y, cos, sin, v, w]
+    state_std: [x, y, theta, v, w] (5차원)
+    Returns:   [x, y, cos, sin, v, w] (6차원 Koopman State)
     """
     x, y, theta, v, w = state_std
     return jnp.array([x, y, jnp.cos(theta), jnp.sin(theta), v, w])
@@ -28,32 +23,34 @@ def lift_state(state_std):
 def step_(state, control, dt):
     """
     state:   [x, y, c, s, v, w]
-    control: [accel_v, accel_w]
+    control: [accel_v, accel_w] (가속도 입력)
     """
     x, y, c, s, v, w = state
     av, aw = control
 
-    # 1. 속도 업데이트
+    # 1. 속도 업데이트 (Euler Integration)
     next_v = v + av * dt
     next_w = w + aw * dt
 
-    # 2. 위치 업데이트 (Kinematics)
+    # 2. 위치 업데이트 (변경된 속도 기반)
+    # 회전 행렬 계산 (Kinematics)
     rot_c = jnp.cos(next_w * dt)
     rot_s = jnp.sin(next_w * dt)
 
     next_c = c * rot_c - s * rot_s
     next_s = s * rot_c + c * rot_s
     
+    # x, y 이동
     next_x = x + next_v * next_c * dt
     next_y = y + next_v * next_s * dt
 
     return jnp.array([next_x, next_y, next_c, next_s, next_v, next_w])
 
 # =========================================================
-# 2. ProxQP Projector (Using jaxproxqp)
+# 2. QP Projector (Safety Filter + Terminal Constraints)
 # =========================================================
 
-class ProxQPProjector:
+class QPProjector:
     def __init__(self, horizon, n_cp, dt, bspline_gen):
         self.H = horizon
         self.N_cp = n_cp
@@ -61,25 +58,23 @@ class ProxQPProjector:
         self.bspline = bspline_gen
         self.dim_var = n_cp * 2
 
-        # [Solver Settings]
-        # 정확도와 속도 균형을 위한 설정
-        self.settings = Settings()
-        self.settings.max_iter = 3
-        self.settings.max_iter_in = 5
-        self.settings.eps_abs = 1e-2    
-        self.settings.max_iterative_refine = 1
+        # [Solver] BatchedADMM (Custom Implementation)
+        # rho: Penalty Parameter (2.0 ~ 5.0 권장)
+        self.solver = BatchedADMM(n_vars=self.dim_var, rho=2.0, max_iter=20)
 
-        # [Input Constraints] Box Constraints for jaxproxqp
+        # [Constraints] 입력은 이제 '가속도'입니다.
+        # 선가속도: -1.0 ~ 1.0 m/s^2, 각가속도: -2.0 ~ 2.0 rad/s^2
         self.u_min = jnp.array([-1.0, -2.0]) 
         self.u_max = jnp.array([ 1.0,  2.0])
 
     @partial(jax.jit, static_argnums=(0,))
     def rollout_fn(self, coeffs, z0):
+        # B-Spline으로 가속도 시퀀스 생성
         u_seq = self.bspline.get_sequence(coeffs)
         
         def step_fn(carry, u):
             z_next = step_(carry, u, self.dt)
-            return z_next, z_next # Return full state
+            return z_next, z_next # 전체 상태 반환 (6차원)
             
         _, traj = jax.lax.scan(step_fn, z0, u_seq)
         return traj
@@ -89,134 +84,93 @@ class ProxQPProjector:
         return jax.jacfwd(self.rollout_fn, argnums=0)(coeffs, z0)
 
     @partial(jax.jit, static_argnums=(0,))
-    def project_single_sample(self, coeffs_noisy, z0, obs_pos, obs_r, target_pos):
-        """
-        Samples projection using JaxProxQP with Warm Start.
-        
-        minimize 0.5 * ||x - coeffs_noisy||^2
-        s.t.     l_box <= x <= u_box
-                 A x = b          (Terminal State Equality)
-                 l <= C x <= u    (Obstacle Avoidance Inequality)
-        """
-        # 1. Trajectory & Jacobian
-        p_traj = self.rollout_fn(coeffs_noisy, z0)      # (H, 6)
+    def project_single_sample(self, coeffs_noisy, z0, obs_pos, obs_r, prev_solver_state):
+        # 1. 궤적 및 자코비안 계산
+        p_traj = self.rollout_fn(coeffs_noisy, z0)      # (H, 6) [x,y,c,s,v,w]
         J_tensor = self.jac_fn(coeffs_noisy, z0)        # (H, 6, N_CP, 2)
 
         # ---------------------------------------------------
-        # [Objective] minimize ||x - coeffs_noisy||^2
-        # => 0.5 * x' I x - coeffs_noisy' x
+        # Constraint 1: 장애물 회피 (위치 x, y만 사용)
         # ---------------------------------------------------
-        H_mat = jnp.eye(self.dim_var)
-        g_vec = -coeffs_noisy.flatten()
-
-        # ---------------------------------------------------
-        # [Constraint 1] Box Constraints (l_box, u_box)
-        # ---------------------------------------------------
-        l_box = jnp.tile(self.u_min, self.N_cp)
-        u_box = jnp.tile(self.u_max, self.N_cp)
-
-        # ---------------------------------------------------
-        # [Constraint 2] Equality Constraints (A x = b)
-        # Terminal State (Zero Velocity) at step H
-        # ---------------------------------------------------
-        v_final = p_traj[-1, 4]
-        w_final = p_traj[-1, 5]
-        
-        J_v_end = J_tensor[-1, 4].reshape(1, -1)
-        J_w_end = J_tensor[-1, 5].reshape(1, -1)
-        
-        # Linearized: J * delta = -val  =>  A * x = b
-        # 주의: x는 delta가 아니라 전체 coeffs임에 주의해야 하나, 
-        # 여기서는 편의상 x를 전체 coeffs로 두고 QP를 풀 수 있도록
-        # A * (coeffs_noisy + delta) = 0 가 되도록 설정하는 것이 아니라
-        # linearization around coeffs_noisy: 
-        # val + J * (x - coeffs_noisy) = 0  =>  J * x = J * coeffs_noisy - val
-        
-        # A matrix
-        A_eq = jnp.vstack([J_v_end, J_w_end]) # (2, dim_var)
-        
-        # b vector
-        # Current val: [v_final, w_final]
-        # Target: 0
-        # Linear approx: val + J * delta = 0  => J * delta = -val
-        # x = x_nominal + delta => delta = x - x_nominal
-        # J * (x - x_nominal) = -val
-        # J * x = J * x_nominal - val
-        b_eq = A_eq @ coeffs_noisy.flatten() - jnp.array([v_final, w_final])
-
-        # ---------------------------------------------------
-        # [Constraint 3] Inequality Constraints (l <= C x <= u)
-        # Obstacle Avoidance
-        # ---------------------------------------------------
-        pos_traj = p_traj[:, :2]
+        pos_traj = p_traj[:, :2] # (H, 2)
         diff = pos_traj - obs_pos 
         dist_sq = jnp.sum(diff**2, axis=1)              
         dist_vals = jnp.sqrt(dist_sq) + 1e-6            
         normals = diff / dist_vals[:, None]             # (H, 2)
 
-        J_pos = J_tensor[:, :2, :, :] 
-        J_flat = J_pos.reshape(self.H, 2, self.dim_var)
+        # Linearization: - (Normal @ J) * delta <= - (req - dist)
+        J_pos = J_tensor[:, :2, :, :] # (H, 2, N_CP, 2)
+        J_flat = J_pos.reshape(self.H, 2, -1)
         
-        # Linearization: dist >= req_dist
-        # dist_val + n^T * J * (x - x_nom) >= req_dist
-        # n^T * J * x >= req_dist - dist_val + n^T * J * x_nom
-        
-        # C matrix (H rows)
-        C_ineq = jnp.einsum('td,tdv->tv', normals, J_flat)
+        A_obs = -jnp.einsum('td,tdv->tv', normals, J_flat)
         
         safe_margin = 0.3
         req_dist = obs_r + safe_margin
-        
-        # Lower bound for C*x
-        l_ineq = req_dist - dist_vals + (C_ineq @ coeffs_noisy.flatten())
-        # Upper bound (infinity)
-        u_ineq = jnp.full_like(l_ineq, 1e5) 
+        b_obs = -(req_dist - dist_vals)
+        l_obs = jnp.full_like(b_obs, -1e9) # One-sided
 
         # ---------------------------------------------------
-        # [Create QP Model]
+        # Constraint 2: 입력 제한 (Box Constraint)
         # ---------------------------------------------------
-        # Note: QPModel.create supports A, b for equalities if implemented in the repo version.
-        # If not supported in your specific version, map A/b to C/l/u with tight bounds.
-        # Assuming standard ProxQP formulation structure:
-        qp = QPModel.create(
-            H=H_mat, g=g_vec,
-            A=A_eq, b=b_eq,            # Equality
-            C=C_ineq, l=l_ineq, u=u_ineq, # Inequality
-            l_box=l_box, u_box=u_box
-        )
+        coeffs_flat = coeffs_noisy.reshape(-1)
+        u_min_tiled = jnp.tile(self.u_min, self.N_cp)
+        u_max_tiled = jnp.tile(self.u_max, self.N_cp)
+        
+        l_input = u_min_tiled - coeffs_flat
+        u_input = u_max_tiled - coeffs_flat
+        A_input = jnp.eye(self.dim_var)
 
         # ---------------------------------------------------
-        # [Solve with Warm Start]
+        # Constraint 3: [핵심] 종단 속도 0 강제 (Terminal Velocity)
         # ---------------------------------------------------
-        solver = JaxProxQP(qp, self.settings)
+        # 마지막 상태의 v(4), w(5) 인덱스
+        v_final = p_traj[-1, 4]
+        w_final = p_traj[-1, 5]
         
-        # Warm Start Strategy:
-        # init_x: 우리는 x_nominal(coeffs_noisy) 주변에서 해를 찾고 있으므로, 
-        #         coeffs_noisy 자체가 훌륭한 Primal 초기값입니다.
-        # init_y: 등식 제약(속도)에 대한 Dual 변수 (0으로 초기화)
-        # init_z: 부등식 제약(장애물)에 대한 Dual 변수 (0으로 초기화)
+        # Jacobian for v and w at terminal step
+        J_v_end = J_tensor[-1, 4].reshape(1, -1)
+        J_w_end = J_tensor[-1, 5].reshape(1, -1)
         
-        n_eq = A_eq.shape[0]
-        n_ineq = C_ineq.shape[0]
+        # Eq: v_final + J * delta = 0  =>  J * delta = -v_final
+        A_term = jnp.vstack([J_v_end, J_w_end])
+        b_term = jnp.array([-v_final, -w_final])
         
-        # solve() 메서드가 init_x, init_y, init_z를 지원한다고 가정 (ProxQP 표준)
-        sol = solver.solve()
+        # 등식 제약이므로 l과 u를 아주 좁게 설정 (Soft Constraint 효과)
+        tol = 1e-3
+        l_term = b_term - tol
+        u_term = b_term + tol
+
+        # ---------------------------------------------------
+        # 행렬 통합 (Stacking)
+        # ---------------------------------------------------
+        A = jnp.vstack([A_obs, A_input, A_term])
+        l = jnp.concatenate([l_obs, l_input, l_term])
+        u = jnp.concatenate([b_obs, u_input, u_term])
+
+        P = jnp.eye(self.dim_var)
+        q = jnp.zeros(self.dim_var)
         
-        safe_coeffs = sol.x.reshape(self.N_cp, 2)
-        return safe_coeffs, sol.x # Return raw x if needed later
+        # init_params = prev_solver_state if prev_solver_state is not None else None
+
+        # ADMM Solve
+        delta, final_state = self.solver.solve(P, q, A, l, u)
+
+        safe_coeffs = coeffs_noisy + delta.reshape(self.N_cp, 2)
+        
+        return safe_coeffs, final_state
 
 # =========================================================
-# 3. ProxQP MPPI (MPPI Logic Wrapper)
+# 3. Projected MPPI 
 # =========================================================
 
-class ProxMPPI:
+class ProjectedMPPI:
     def __init__(self, horizon, n_cp, dt, n_samples, temperature, bspline_gen):
         self.H = horizon
         self.N_cp = n_cp
         self.dt = dt
         self.K = n_samples
         self.lambda_ = temperature
-        self.projector = ProxQPProjector(horizon, n_cp, dt, bspline_gen)
+        self.projector = QPProjector(horizon, n_cp, dt, bspline_gen)
 
     @partial(jax.jit, static_argnums=(0,))
     def compute_cost(self, coeffs, z0, target_pos, obs_pos, obs_r):
@@ -233,12 +187,14 @@ class ProxMPPI:
         dist = jnp.sqrt(jnp.sum((pos_traj - obs_pos)**2, axis=1))
         obs_cost = jnp.sum(jnp.exp(-5.0 * (dist - obs_r - 0.2)))
         
-        # 3. 부드러움 (Jerk)
+        # 3. 부드러움 (가속도의 변화량 = Jerk 최소화)
         diffs = jnp.diff(coeffs, axis=0) 
         smoothness_cost = jnp.sum(diffs**2)
         
-        # 4. 에너지 및 종단 정지 비용
+        # 4. [NEW] 에너지 및 종단 정지 비용
+        # 에너지는 가속도(입력)의 크기
         energy_cost = jnp.sum(coeffs**2) 
+        # 마지막 속도가 0이어야 함 (QP에서 강제하지만 Cost로도 유도)
         terminal_vel_cost = jnp.sum(vel_traj[-1]**2)
 
         total_cost = (
@@ -247,25 +203,24 @@ class ProxMPPI:
             10.0 * obs_cost + 
             5.0 * smoothness_cost +
             0.1 * energy_cost +
-            30.0 * terminal_vel_cost 
+            30.0 * terminal_vel_cost # 정지 중요도 높음
         )
         return total_cost
 
     @partial(jax.jit, static_argnums=(0,))
-    def step(self, key, mean_coeffs, z0, target_pos, obs_pos, obs_r):
-        # 1. Adaptive Noise
+    def step(self, key, mean_coeffs, z0, target_pos, obs_pos, obs_r, prev_solver_state):
+        # 1. Adaptive Noise (목표 근처에서 노이즈 감소)
         dist_to_goal = jnp.linalg.norm(z0[:2] - target_pos)
-        sigma = jnp.where(dist_to_goal < 1.0, 0.2, 0.6)
+        sigma = jnp.where(dist_to_goal < 1.0, 0.2, 0.6) # 가속도 노이즈
         
         noise = jax.random.normal(key, (self.K, self.N_cp, 2)) * sigma
         raw_samples = mean_coeffs + noise
         
-        # 2. Parallel Projection (using JaxProxQP)
-        # vmap over K samples
+        # 2. Parallel Projection (Safety Filter)
         project_fn = jax.vmap(self.projector.project_single_sample, in_axes=(0, None, None, None, None))
-        safe_samples, _ = project_fn(raw_samples, z0, obs_pos, obs_r, target_pos)
+        safe_samples, solver_states = project_fn(raw_samples, z0, obs_pos, obs_r, prev_solver_state)
         
-        # 3. Cost Evaluation
+        # 3. Cost Evaluation & Masking
         cost_fn = jax.vmap(self.compute_cost, in_axes=(0, None, None, None, None))
         costs = cost_fn(safe_samples, z0, target_pos, obs_pos, obs_r)
         
@@ -276,10 +231,15 @@ class ProxMPPI:
         weights_expanded = weights[:, None, None]
         new_mean = jnp.sum(weights_expanded * safe_samples, axis=0)
         
-        alpha = 0.9 
+        alpha = 0.9 # Update rate
         final_mean = alpha * new_mean + (1 - alpha) * mean_coeffs
         
-        return final_mean, safe_samples, weights
+        # Warm Start Update (Best Sample's Dual Variables)
+        best_idx = jnp.argmin(costs)
+        # solver_states: tuple (x, z, y)
+        next_solver_state = jax.tree_util.tree_map(lambda x: x[best_idx], solver_states)
+        
+        return final_mean, safe_samples, weights, next_solver_state
 
 # =========================================================
 # Main Execution Loop
@@ -292,25 +252,26 @@ def run():
     TEMP = 0.5      
     
     bspline_gen = BSplineBasis(N_CP, HORIZON)
-    mppi = ProxMPPI(HORIZON, N_CP, DT, N_SAMPLES, TEMP, bspline_gen)
+    mppi = ProjectedMPPI(HORIZON, N_CP, DT, N_SAMPLES, TEMP, bspline_gen)
     
-    # [초기 상태] x, y, theta, v, w
+    # [초기 상태] x, y, theta, v, w (5차원)
     start_pose = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0])
-    z_curr = lift_state(start_pose) 
+    z_curr = lift_state(start_pose) # -> 6차원 [x,y,c,s,v,w]
     
     target_pos = jnp.array([5.0, 0.0])
     obs_pos = jnp.array([2.5, 0.0])
     obs_r = 0.8
     
-    # 초기 제어 입력
+    # 초기 제어 입력 (가속도 = 0)
     mean_coeffs = jnp.zeros((N_CP, 2))
+    solver_state = None 
     
     key = jax.random.PRNGKey(0)
     traj_hist = [z_curr[:2]]
     
     log_solver_time = [] # ms
 
-    print("Simulation Running ...")
+    print("Simulation Running...")
     
     plt.figure(figsize=(10, 6))
     
@@ -320,11 +281,12 @@ def run():
         jax.block_until_ready(mean_coeffs)
         t0 = time.time()
 
-        # 1. MPPI Step (ProxQP projection inside)
-        mean_coeffs, safe_samples, weights = mppi.step(
-            subkey, mean_coeffs, z_curr, target_pos, obs_pos, obs_r
+        # 1. MPPI Step
+        mean_coeffs, safe_samples, weights, solver_state = mppi.step(
+            subkey, mean_coeffs, z_curr, target_pos, obs_pos, obs_r, solver_state
         )
         
+        # Block valid for timing accurate measurements
         jax.block_until_ready(mean_coeffs)
         t_end = time.time()
 
@@ -333,8 +295,9 @@ def run():
 
         # 2. Apply Control
         u_seq = bspline_gen.get_sequence(mean_coeffs)
-        u_curr = u_seq[0]
+        u_curr = u_seq[0] # 현재 가속도 명령
         
+        # [Goal Latching] 목표 근처 정밀 제어 및 정지
         dist_to_goal = jnp.linalg.norm(z_curr[:2] - target_pos)
 
         # 3. Simulate Dynamics
@@ -363,7 +326,7 @@ def run():
             
             # Mean Trajectory
             mean_traj = mppi.projector.rollout_fn(mean_coeffs, z_curr)
-            plt.plot(mean_traj[:, 0], mean_traj[:, 1], 'b-', linewidth=3, label='ProxQP Path')
+            plt.plot(mean_traj[:, 0], mean_traj[:, 1], 'b-', linewidth=3, label='Optimal Path')
             
             # History
             hist = np.array(traj_hist)
@@ -389,21 +352,21 @@ def run():
 
     plt.figure()
     plt.plot(log_solver_time[3:], label='Solver Time (ms)')
-    plt.title(f"JaxProxQP solver time per step")
+    plt.title(f"Custom ADMM solver time per step")
     plt.xlabel("Simulation Step")
     plt.ylabel("Time (ms)")
     plt.legend()
     plt.show()
-
     # --- Final Stats Print ---
     print("\n" + "="*30)
-    print(" [Simulation Result Summary (JaxProxQP)]")
+    print(" [Simulation Result Summary (Custom)]")
     print("="*30)
     print(f"Avg Solver Time: {np.mean(log_solver_time[3:]):.2f} ms")
     print(f"Max Solver Time: {np.max(log_solver_time[3:]):.2f} ms")
     print(f"Min Solver Time: {np.min(log_solver_time[3:]):.2f} ms")
-    print(f"Median Solver Time: {np.median(log_solver_time[3:]):.2f} ms")
+    print(f"center solver time: {np.median(log_solver_time[3:]):.2f} ms")
     print("="*30)
+
 
 if __name__ == "__main__":
     run()

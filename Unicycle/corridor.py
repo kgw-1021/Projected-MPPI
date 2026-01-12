@@ -4,8 +4,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from functools import partial
 import numpy as np
-from Bspline import BSplineBasis
-from optimize import BatchedADMM
+from Util.Bspline import BSplineBasis
+from Util.optimize import BatchedADMM
 import os
 import shutil   
 import io

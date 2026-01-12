@@ -4,7 +4,7 @@ import jaxopt
 import matplotlib.pyplot as plt
 from functools import partial
 import numpy as np
-from Bspline import BSplineBasis
+from Util.Bspline import BSplineBasis
 import time
 
 @jax.jit

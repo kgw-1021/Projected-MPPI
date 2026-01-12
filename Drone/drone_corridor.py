@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from functools import partial
 from mpl_toolkits.mplot3d import Axes3D
-from optimize import BatchedADMM
+from Util.optimize import BatchedADMM
 import time
 import io
 import imageio.v2 as imageio
