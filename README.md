@@ -4,7 +4,7 @@
 
 Projected MPPI is a high-performance control framework that bridges the gap between sampling-based control (MPPI) and optimization-based control (MPC). This repository implements a **GPU-accelerated Model Predictive Path Integral (MPPI)** controller that strictly enforces hard constraints by projecting sampled trajectories onto safe sets using a custom **Batched Alternating Direction Method of Multipliers (ADMM)** solver.
 
-Built on **JAX**, the entire pipeline is JIT-compiled to a single GPU kernel, enabling the solution of thousands of Quadratic Programming (QP) and Conic Programming problems in parallel at rates exceeding 50Hz. This framework is model-agnostic and has been validated on both **Uni-cycle (2D)** and **Quadrotor (3D)** dynamics.
+Built on **JAX**, the entire pipeline is JIT-compiled to a single GPU kernel, enabling the solution of thousands of Quadratic Programming (QP) Projection problems in parallel at rates exceeding 50Hz. Now, This framework has been validated on both **Uni-cycle (2D)** and **Quadrotor (3D)** dynamics.
 
 ## Simulation Results
 
