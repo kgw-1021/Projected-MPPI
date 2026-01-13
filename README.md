@@ -13,14 +13,14 @@ The drone navigates a constrained tunnel while strictly adhering to velocity and
 
 | Drone Obstacle Avoidance (3D) | Drone Tunnel (3D) |
 | :---: | :---: |
-| <img src="drone/drone_obstacle.gif" width="100%"/> | <img src="drone/drone_corridor.gif" width="100%"/> |
+| <img src="drone_source/drone_obstacle.gif" width="100%"/> | <img src="drone_source/drone_corridor.gif" width="100%"/> |
 
 ### 2. Uni-cycle Narrow Tunnel (2D)
 A non-holonomic vehicle navigates a Narrow Tunnel. Baseline method 
 
 | Ours | Baseline |
 | :---: | :---: |
-| <img src="corridor_test/our_result.gif" width="100%"/> | <img src="corridor_test/baseline_result.gif" width="100%"/> |
+| <img src="corridor_test_source/our_result.gif" width="100%"/> | <img src="corridor_test_source/baseline_result.gif" width="100%"/> |
 
 ## Theoretical Foundation & Extensibility
 
